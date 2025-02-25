@@ -6,6 +6,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from googleapiclient.errors import HttpError
 from dotenv import load_dotenv
+import PyPDF2
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -50,8 +51,14 @@ class GoogleDriveClient:
         try:
             # Attempt to download the file content
             request = self.service.files().get_media(fileId=file_id)
-            response = request.execute()
-            return response.decode('utf-8')
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                logger.info("Download %d%%.", int(status.progress() * 100))
+            fh.seek(0)
+            return fh.read().decode('utf-8')
         except HttpError as error:
             if error.resp.status == 403 and 'fileNotDownloadable' in str(error):
                 # Handle Google Docs Editors files by exporting them
@@ -62,6 +69,29 @@ class GoogleDriveClient:
             else:
                 logger.error("An error occurred: %s", error)
                 raise ValueError(f"An error occurred: {error}")
+
+    def get_pdf_text_content(self, file_id):
+        try:
+            # Download the PDF file content
+            request = self.service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                status, done = downloader.next_chunk()
+                logger.info("Download %d%%.", int(status.progress() * 100))
+            fh.seek(0)
+            
+            # Extract text from the PDF file
+            reader = PyPDF2.PdfFileReader(fh)
+            text_content = ""
+            for page_num in range(reader.numPages):
+                page = reader.getPage(page_num)
+                text_content += page.extract_text()
+            return text_content
+        except HttpError as error:
+            logger.error("An error occurred while downloading or processing the PDF file %s: %s", file_id, error)
+            return None
 
     def export_file(self, file_id, mime_type):
         try:
@@ -97,4 +127,4 @@ if __name__ == '__main__':
     SERVICE_ACCOUNT_FILE = os.getenv("SERVICE_ACCOUNT_FILE")
     SCOPES = os.getenv("SCOPES")
     gdrive_client = GoogleDriveClient(SERVICE_ACCOUNT_FILE, [SCOPES])
-    gdrive_client.list_files()  
+    gdrive_client.list_files()
