@@ -172,3 +172,4 @@ cython_debug/
 config/service-acc-file.json
 .vscode
 *.json
+*.index
