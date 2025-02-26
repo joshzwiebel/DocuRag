@@ -4,7 +4,8 @@ import numpy as np
 import sys
 import json
 from openai import OpenAI
-
+from dotenv import load_dotenv
+load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -25,6 +26,8 @@ class Preprocessor:
         self.client = GoogleDriveClient(service_account_file, scopes)
         self.faiss_index_path = faiss_index_path
         self.index = self.load_or_create_faiss_index()
+        self.current_index = 0
+        self.metadata = {}
 
     def load_or_create_faiss_index(self):
         if os.path.exists(self.faiss_index_path):
@@ -71,16 +74,53 @@ class Preprocessor:
             logger.error("An error occurred while handling file %s: %s", file_id, error)
             return None
 
+    def save_metadata(self):
+        metadata_path = os.path.splitext(self.faiss_index_path)[0] + '_metadata.json'
+        with open(metadata_path, 'w') as f:
+            # Convert integer keys to strings for JSON serialization
+            metadata_str_keys = {str(k): v for k, v in self.metadata.items()}
+            json.dump(metadata_str_keys, f)
+
     def run(self):
         files = self.client.list_files()
         for file in files:
-            content = self.handle_file(file['id'], file['mimeType'])
-            if content:
+            try:
+                content = self.handle_file(file['id'], file['mimeType'])
+                if not content:
+                    continue
+                
                 chunks = self.chunk_text(content)
                 for chunk in chunks:
-                    vector = self.preprocess_file(chunk)
-                    self.store_in_faiss(vector)
-        self.save_faiss_index()
+                    try:
+                        # Process and store both vector and metadata atomically
+                        vector = self.preprocess_file(chunk)
+                        if vector is None:
+                            continue
+                            
+                        # Try storing in FAISS first
+                        self.store_in_faiss(vector)
+                        
+                        # If FAISS storage succeeds, store metadata
+                        self.metadata[self.current_index] = {
+                            'text': chunk,
+                            'file_id': file['id'],
+                            'mime_type': file['mimeType']
+                        }
+                        self.current_index += 1
+                        
+                    except Exception as e:
+                        logger.error(f"Failed to process chunk from file {file['id']}: {str(e)}")
+                        # Skip to next chunk if either storage fails
+                        continue
+                        
+            except Exception as e:
+                logger.error(f"Failed to process file {file['id']}: {str(e)}")
+                continue
+                
+        # Save both indices only if we have processed at least one file
+        if self.current_index > 0:
+            self.save_faiss_index()
+            self.save_metadata()
 
 if __name__ == "__main__":
     faiss_index_path = './vector_store/faiss_index.index'
