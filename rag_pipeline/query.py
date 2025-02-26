@@ -8,7 +8,7 @@ import json
 from openai import OpenAI
 from requests import HTTPError
 import truststore
-
+load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -22,36 +22,69 @@ logging.DEBUG = True
 class FaissQuery:
     def __init__(self, faiss_index_path):
         load_dotenv()
-        self.faiss_index_path = faiss_index_path
-        self.index = self.load_faiss_index()
         service_account_file = os.getenv("SERVICE_ACCOUNT_FILE")
         scopes = os.getenv("SCOPES").split(',')
         self.client = GoogleDriveClient(service_account_file, scopes)
+        self.index = faiss.read_index(faiss_index_path)
+        self.metadata_path = os.path.splitext(faiss_index_path)[0] + '_metadata.json'
+        self.metadata = self.load_metadata()
 
-    def load_faiss_index(self):
-        if os.path.exists(self.faiss_index_path):
-            logger.info("Loading FAISS index from %s", self.faiss_index_path)
-            return faiss.read_index(self.faiss_index_path)
-        else:
-            logger.error("FAISS index file not found at %s", self.faiss_index_path)
-            raise FileNotFoundError(f"FAISS index file not found at {self.faiss_index_path}")
+    def load_metadata(self):
+        if os.path.exists(self.metadata_path):
+            with open(self.metadata_path, 'r') as f:
+                return json.load(f)
+        return {}
 
-    def query(self, query_vector, k=1):
-        logger.info("Querying FAISS index with k=%d", k)
-        query_vector = np.array([query_vector]).astype('float32')
-        distances, indices = self.index.search(query_vector, k)
-        return distances, indices
+    def query(self, query_text, k=5):
+        query_vector = self.text_to_vector(query_text)
+        distances, indices = self.index.search(np.array([query_vector]).astype('float32'), k)
+        
+        results = []
+        for idx in indices[0]:
+            if str(idx) in self.metadata:
+                result = self.metadata[str(idx)]
+                results.append(result)
+        
+        return distances[0], results
 
     def get_file_content(self, file_id, mime_type):
+        """Get text content from various file types."""
         try:
-            if mime_type == 'application/pdf':
-                return self.client.get_pdf_text_content(file_id)
-            elif mime_type.startswith('application/vnd.google-apps'):
+            # Google Workspace files need special export handling
+            if mime_type.startswith('application/vnd.google-apps'):
                 return self.client.export_file(file_id, mime_type)
+            
+            # All other supported document types
+            supported_types = {
+                # PDF files
+                'application/pdf': 'pdf',
+                
+                # Microsoft Office formats
+                'application/msword': 'doc',
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+                'application/vnd.ms-excel': 'xls',
+                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+                'application/vnd.ms-powerpoint': 'ppt',
+                'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+                
+                # Text formats
+                'text/plain': 'txt',
+                'text/csv': 'csv',
+                'text/markdown': 'md',
+                'application/json': 'json',
+                'application/xml': 'xml',
+                'text/html': 'html',
+                'application/rtf': 'rtf'
+            }
+            
+            if mime_type in supported_types:
+                return self.client.extract_text(file_id, mime_type)
             else:
-                return self.client.get_file_content(file_id)
-        except HTTPError as error:
-            logger.error("An error occurred while retrieving file content: %s", error)
+                logger.warning(f"Unsupported mime type: {mime_type}")
+                return None
+
+        except Exception as error:
+            logger.error(f"Error retrieving file {file_id}: {error}")
             return None
 
     def text_to_vector(self, text):
@@ -72,14 +105,15 @@ if __name__ == "__main__":
     # Convert user input to query vector
     query_vector = faiss_query.text_to_vector(user_input)
 
-    distances, indices = faiss_query.query(query_vector, k=1)
+    distances, results = faiss_query.query(user_input, k=5)
 
     logger.info("Query results:")
     files = faiss_query.client.list_files()
-    for i, (dist, idx) in enumerate(zip(distances[0], indices[0])):
-        logger.info("Result %d: Index %d, Distance %f", i, idx, dist)
-        file = files[idx]
-        file_content = faiss_query.get_file_content(file['id'], file['mimeType'])
+    for i, (dist, result) in enumerate(zip(distances, results)):
+        logger.info("Result %d: Distance %f", i, dist)
+        file_id = result['file_id']
+        mime_type = result['mime_type']
+        file_content = faiss_query.get_file_content(file_id, mime_type)
         if file_content:
             logger.info("File Content: %s", file_content)
         else:
